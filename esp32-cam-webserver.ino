@@ -1,3 +1,4 @@
+#include <PubSubClient.h>
 #include <esp_camera.h>
 #include <esp_int_wdt.h>
 #include <esp_task_wdt.h>
@@ -7,32 +8,26 @@
 #include "src/parsebytes.h"
 #include "time.h"
 
+//MQTT config
+bool useMQTT = true;
+const char* mqttServer = "iot.fr-par.scw.cloud";
+const char* HostName = "ESP32-CAM_Scaleway";
+const char* mqttUser = "e79d99a3-5b63-4b31-93d6-816c401dac28";
+const char* mqttPassword = "e79d99a3-5b63-4b31-93d6-816c401dac28";
+const char* topic_PING = "iot/e00fce686881d380921acd98/PING";
+const char* topic_HEARTBEAT = "iot/e00fce686881d380921acd98/HEARTBEAT";
+const char* topic_PHOTO = "iot/e00fce686881d380921acd98/PHOTO";
+const char* topic_PUBLISH = "images/iot/e00fce686881d380921acd98/PROFILE";
+const char* topic_STREAM = "iot/e00fce686881d380921acd98/STREAM";
+const char* topic_STARTSTREAM = "iot/e00fce686881d380921acd98/START";
+//  max value of uint16_t.
+const int MAX_PAYLOAD = 65530;
 
-/* This sketch is a extension/expansion/reork of the 'official' ESP32 Camera example
- *  sketch from Expressif:
- *  https://github.com/espressif/arduino-esp32/tree/master/libraries/ESP32/examples/Camera/CameraWebServer
- *
- *  It is modified to allow control of Illumination LED Lamps's (present on some modules),
- *  greater feedback via a status LED, and the HTML contents are present in plain text
- *  for easy modification.
- *
- *  A camera name can now be configured, and wifi details can be stored in an optional 
- *  header file to allow easier updated of the repo.
- *
- *  The web UI has had changes to add the lamp control, rotation, a standalone viewer,
- *  more feeedback, new controls and other tweaks and changes,
- * note: Make sure that you have either selected ESP32 AI Thinker,
- *       or another board which has PSRAM enabled to use high resolution camera modes
- */
+unsigned long lastHeartBeat;
+bool cameraBusy;
 
-
-/* 
- *  FOR NETWORK AND HARDWARE SETTINGS COPY OR RENAME 'myconfig.sample.h' TO 'myconfig.h' AND EDIT THAT.
- *
- * By default this sketch will assume an AI-THINKER ESP-CAM and create
- * an accesspoint called "ESP32-CAM-CONNECT" (password: "InsecurePassword")
- *
- */
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 // Primary config, or defaults.
 #if __has_include("myconfig.h")
@@ -60,6 +55,7 @@
 int sketchSize;
 int sketchSpace;
 String sketchMD5;
+int streamFrameCount;
 
 // Start with accesspoint mode disabled, wifi setup will activate it if
 // no known networks are found, and WIFI_AP_ENABLE has been defined
@@ -95,7 +91,7 @@ extern void serialDump();
 #endif
 
 #if !defined(WIFI_WATCHDOG)
-    #define WIFI_WATCHDOG 8000
+    #define WIFI_WATCHDOG 5000
 #endif
 
 // Number of known networks in stationList[]
@@ -147,7 +143,7 @@ char myVer[] PROGMEM = __DATE__ " @ " __TIME__;
 #endif
 int myRotation = CAM_ROTATION;
 
-// Illumination LAMP and status LED
+// Illumination LAMP/LED
 #if defined(LAMP_DISABLE)
     int lampVal = -1; // lamp is disabled in config
 #elif defined(LAMP_PIN)
@@ -159,11 +155,6 @@ int myRotation = CAM_ROTATION;
 #else 
     int lampVal = -1; // no lamp pin assigned
 #endif
-
-#if defined(LED_DISABLE)
-    #undef LED_PIN    // undefining this disables the notification LED
-#endif
-
 bool autoLamp = false;         // Automatic lamp (auto on while camera running)
 
 int lampChannel = 7;           // a free PWM channel (some channels used by camera)
@@ -183,20 +174,14 @@ const int pwmMax = pow(2,pwmresolution)-1;
     bool otaEnabled = true;
 #endif
 
-#if defined(OTA_PASSWORD)
-    char otaPassword[] = OTA_PASSWORD;
-#else
-    char otaPassword[] = "";
-#endif
-
 #if defined(NTPSERVER)
     bool haveTime = true;
     const char* ntpServer = NTPSERVER;
     const long  gmtOffset_sec = NTP_GMT_OFFSET;
     const int   daylightOffset_sec = NTP_DST_OFFSET;
 #else
-    bool haveTime = false;
-    const char* ntpServer = "";
+    bool haveTime = true;
+    const char* ntpServer = "pool.ntp.org";
     const long  gmtOffset_sec = 0;
     const int   daylightOffset_sec = 0;
 #endif
@@ -266,26 +251,6 @@ void printLocalTime(bool extraData=false) {
     if (extraData) {
         Serial.printf("NTP Server: %s, GMT Offset: %li(s), DST Offset: %i(s)\r\n", ntpServer, gmtOffset_sec, daylightOffset_sec);
     }
-}
-
-void calcURLs() {
-    // Set the URL's
-    #if defined(URL_HOSTNAME)
-        if (httpPort != 80) {
-            sprintf(httpURL, "http://%s:%d/", URL_HOSTNAME, httpPort);
-        } else {
-            sprintf(httpURL, "http://%s/", URL_HOSTNAME);
-        }
-        sprintf(streamURL, "http://%s:%d/", URL_HOSTNAME, streamPort);
-    #else
-        Serial.println("Setting httpURL");
-        if (httpPort != 80) {
-            sprintf(httpURL, "http://%d.%d.%d.%d:%d/", ip[0], ip[1], ip[2], ip[3], httpPort);
-        } else {
-            sprintf(httpURL, "http://%d.%d.%d.%d/", ip[0], ip[1], ip[2], ip[3]);
-        }
-        sprintf(streamURL, "http://%d.%d.%d.%d:%d/", ip[0], ip[1], ip[2], ip[3], streamPort);
-    #endif
 }
 
 void WifiSetup() {
@@ -414,7 +379,6 @@ void WifiSetup() {
             Serial.printf("IP address: %d.%d.%d.%d\r\n",ip[0],ip[1],ip[2],ip[3]);
             Serial.printf("Netmask   : %d.%d.%d.%d\r\n",net[0],net[1],net[2],net[3]);
             Serial.printf("Gateway   : %d.%d.%d.%d\r\n",gw[0],gw[1],gw[2],gw[3]);
-            calcURLs();
             // Flash the LED to show we are connected
             for (int i = 0; i < 5; i++) {
                 flashLED(50);
@@ -460,7 +424,6 @@ void WifiSetup() {
         gw = WiFi.gatewayIP();
         strcpy(apName, stationList[0].ssid);
         Serial.printf("IP address: %d.%d.%d.%d\r\n",ip[0],ip[1],ip[2],ip[3]);
-        calcURLs();
         // Flash the LED to show we are connected
         for (int i = 0; i < 5; i++) {
             flashLED(150);
@@ -489,6 +452,8 @@ void setup() {
     Serial.print("Base Release: ");
     Serial.println(baseVersion);
 
+    lastHeartBeat = 0;
+    cameraBusy = false;
     if (stationCount == 0) {
       Serial.println("\r\nFatal Error; Halting");
       while (true) {
@@ -526,10 +491,12 @@ void setup() {
     config.pixel_format = PIXFORMAT_JPEG;
     // Pre-allocate large buffers
     if(psramFound()){
+        Serial.println("psram Found");
         config.frame_size = FRAMESIZE_UXGA;
         config.jpeg_quality = 10;
-        config.fb_count = 6;  // We can be generous since we are not using facedetect anymore, allows for bigger jpeg frame size (data)
+        config.fb_count = 2;  // We can be generous since we are not using facedetect anymore, allows for bigger jpeg frame size (data)
     } else {
+        Serial.println("psram Found");
         config.frame_size = FRAMESIZE_SVGA;
         config.jpeg_quality = 12;
         config.fb_count = 1;
@@ -609,7 +576,7 @@ void setup() {
         * https://github.com/espressif/esp32-camera/blob/master/driver/include/sensor.h#L149
         */
 
-        //s->set_framesize(s, FRAMESIZE_SVGA); // FRAMESIZE_[QQVGA|HQVGA|QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA|QXGA(ov3660)]);
+        s->set_framesize(s, FRAMESIZE_VGA); // FRAMESIZE_[QQVGA|HQVGA|QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA|QXGA(ov3660)]);
         //s->set_quality(s, val);       // 10 to 63
         //s->set_brightness(s, 0);      // -2 to 2
         //s->set_contrast(s, 0);        // -2 to 2
@@ -630,7 +597,7 @@ void setup() {
         //s->set_raw_gma(s, 1);         // 0 = disable , 1 = enable
         //s->set_lenc(s, 1);            // 0 = disable , 1 = enable
         //s->set_hmirror(s, 0);         // 0 = disable , 1 = enable
-        //s->set_vflip(s, 0);           // 0 = disable , 1 = enable
+        s->set_vflip(s, 1);           // 0 = disable , 1 = enable
         //s->set_dcw(s, 1);             // 0 = disable , 1 = enable
         //s->set_colorbar(s, 0);        // 0 = disable , 1 = enable
 
@@ -641,7 +608,7 @@ void setup() {
             filesystemStart();
             loadPrefs(SPIFFS);
         } else {
-            Serial.println("No Internal Filesystem, cannot load or save preferences");
+            Serial.println("No Internal Filesystem, cannot save preferences");
         }
     }
 
@@ -654,9 +621,7 @@ void setup() {
         ledcSetup(lampChannel, pwmfreq, pwmresolution);  // configure LED PWM channel
         if (autoLamp) setLamp(0);                        // set default value
         else setLamp(lampVal);
-        #if defined(LAMP_PIN)
-            ledcAttachPin(LAMP_PIN, lampChannel);            // attach the GPIO pin to the channel
-        #endif
+        ledcAttachPin(LAMP_PIN, lampChannel);            // attach the GPIO pin to the channel
     } else {
         Serial.println("No lamp, or lamp disabled in config");
     }
@@ -675,12 +640,10 @@ void setup() {
         // Hostname defaults to esp3232-[MAC]
         ArduinoOTA.setHostname(myName);
         // No authentication by default
-        if (strlen(otaPassword) != 0) {
-            ArduinoOTA.setPassword(otaPassword);
-            Serial.printf("OTA Password: %s\n\r", otaPassword);
-        } else {
-            Serial.printf("\r\nNo OTA password has been set! (insecure)\r\n\r\n");
-        }
+        #if defined (OTA_PASSWORD)
+            ArduinoOTA.setPassword(OTA_PASSWORD);
+            Serial.printf("OTA Password: %s\n\r", OTA_PASSWORD);
+        #endif
         ArduinoOTA
             .onStart([]() {
               String type;
@@ -692,7 +655,7 @@ void setup() {
               Serial.println("Start updating " + type);
             })
             .onEnd([]() {
-              Serial.println("\r\nEnd");
+              Serial.println("\nEnd");
             })
             .onProgress([](unsigned int progress, unsigned int total) {
               Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
@@ -722,6 +685,21 @@ void setup() {
     // Now we have a network we can start the two http handlers for the UI and Stream.
     startCameraServer(httpPort, streamPort);
 
+    #if defined(URL_HOSTNAME)
+        if (httpPort != 80) {
+            sprintf(httpURL, "http://%s:%d/", URL_HOSTNAME, httpPort);
+        } else {
+            sprintf(httpURL, "http://%s/", URL_HOSTNAME);
+        }
+        sprintf(streamURL, "http://%s:%d/", URL_HOSTNAME, streamPort);
+    #else
+         if (httpPort != 80) {
+            sprintf(httpURL, "http://%d.%d.%d.%d:%d/", ip[0], ip[1], ip[2], ip[3], httpPort);
+        } else {
+            sprintf(httpURL, "http://%d.%d.%d.%d/", ip[0], ip[1], ip[2], ip[3]);
+        }
+        sprintf(streamURL, "http://%d.%d.%d.%d:%d/", ip[0], ip[1], ip[2], ip[3], streamPort);
+    #endif
     if (critERR.length() == 0) {
         Serial.printf("\r\nCamera Ready!\r\nUse '%s' to connect\r\n", httpURL);
         Serial.printf("Stream viewer available at '%sview'\r\n", streamURL);
@@ -748,9 +726,146 @@ void setup() {
         Serial.printf("\r\nNo PSRAM found.\r\nPlease check the board config for your module.\r\n");
         Serial.printf("High resolution/quality images & streams will show incomplete frames due to low memory.\r\n");
     }
+      
+    // Set MQTT Connection
+    client.setServer(mqttServer, 1883);
+    client.setBufferSize(MAX_PAYLOAD); //This is the maximum payload length
+    client.setCallback(callback);
+    Serial.printf("\r\nStarting MQTT connection...\r\n");
+}
 
-    // While in Beta; Warn!
-    Serial.print("\r\nThis is the 4.0 alpha\r\n - Face detection has been removed!\r\n");
+void callback(String topic, byte* message, unsigned int length) {
+  String messageTemp;
+  Serial.println(topic);
+  for (int i = 0; i < length; i++) {
+    messageTemp += (char)message[i];
+  }
+  if (topic == topic_PHOTO) {
+    take_picture();
+  } else if (topic == topic_STARTSTREAM) {
+    streamFrameCount = 30;
+//    take_picture();
+  } else if (topic == topic_PING) {
+    pongMQTT();
+  }
+}
+
+void pongMQTT() {
+  if (client.connected()) {
+    // TODO: send frameCount in heartbeat event data
+    long rssi = WiFi.RSSI();
+    Serial.print("RSSI:");
+    Serial.println(rssi);
+    String pubStr = String(streamFrameCount) + "," + String(rssi);
+    const char* data_to_send_ptr = pubStr.c_str();
+//    char* data_to_send_ptr = "BEAT";
+    uint8_t* data_to_send = (uint8_t*) data_to_send_ptr;
+    int len = strlen(data_to_send_ptr);
+    client.publish(topic_HEARTBEAT, data_to_send, len, false);
+  }
+}
+
+void sendPhotoMQTT(const uint8_t * buf, uint32_t len){
+  Serial.println("Sending picture... with len");
+  Serial.println(len);
+  if(len>MAX_PAYLOAD){
+    Serial.print("Picture too large, increase the MAX_PAYLOAD value");
+  }else{
+    Serial.print("Picture sent ? : ");
+    client.publish(topic_PUBLISH, buf, len, false);
+    String galleryTopicString = "images/iot/e00fce686881d380921acd98/all/" + String(getTime()) + "000.jpg";
+    const char* galleryTopic = galleryTopicString.c_str();
+    client.publish(galleryTopic, buf, len, false);
+  }
+}
+
+
+void sendStreamMQTT(const uint8_t * buf, uint32_t len){
+  Serial.println("sendStreamMQTT Sending picture... with len");
+  Serial.println(len);
+  
+  if(len>MAX_PAYLOAD){
+    Serial.print("Picture too large, increase the MAX_PAYLOAD value");
+  } else {
+    Serial.print("Picture published, result: ");
+    boolean rc = client.publish(topic_STREAM, buf, len, false);
+    if (rc) {
+      streamFrameCount = streamFrameCount - 1;
+    }
+    Serial.println(rc);
+   Serial.println("\n");
+  }
+}
+
+void take_picture() {
+  camera_fb_t * fb = NULL;
+  Serial.println("Taking picture");
+  fb = esp_camera_fb_get(); // used to get a single picture.
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+  Serial.println("Picture taken");
+  sendPhotoMQTT(fb->buf, fb->len);
+  esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+  
+}
+
+void process_stream() {
+  
+  Serial.println("process_stream streamFrameCount");
+  Serial.println(streamFrameCount);
+  if (!cameraBusy) {
+    
+    Serial.println("get new stream frame");
+    cameraBusy = true;
+    camera_fb_t * fb = NULL;
+    fb = esp_camera_fb_get(); // used to get a single picture.
+    if (!fb) {
+      cameraBusy = false;
+      delay(500);
+      return;
+    }
+    sendStreamMQTT(fb->buf, fb->len);
+    esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+    cameraBusy = false;
+  } else {
+    
+    Serial.println("camera busy");
+  }
+}
+
+
+// Variable to save current epoch time
+unsigned long epochTime; 
+
+// Function that gets current epoch time
+unsigned long getTime() {
+  time_t now;
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    //Serial.println("Failed to obtain time");
+    return(1);
+  }
+  time(&now);
+  return now;
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect(HostName, mqttUser, mqttPassword)) {
+      Serial.println("connected");
+      client.subscribe(topic_PHOTO);
+      client.subscribe(topic_STARTSTREAM);
+      client.subscribe(topic_PING);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
 }
 
 void loop() {
@@ -759,6 +874,8 @@ void loop() {
      * The stream and URI handler processes initiated by the startCameraServer() call at the
      * end of setup() will handle the camera and UI processing from now on.
     */
+    
+    Serial.print("loop");
     if (accesspoint) {
         // Accespoint is permanently up, so just loop, servicing the captive portal as needed
         // Rather than loop forever, follow the watchdog, in case we later add auto re-scan.
@@ -779,13 +896,31 @@ void loop() {
                 Serial.println("WiFi reconnected");
                 warned = false;
             }
-            // loop here for WIFI_WATCHDOG, turning debugData true/false depending on serial input..
-            unsigned long start = millis();
-            while (millis() - start < WIFI_WATCHDOG ) {
-                delay(100);
-                if (otaEnabled) ArduinoOTA.handle();
-                handleSerial();
+
+           if (!client.connected()) {
+              reconnect();
             }
+            client.loop();
+            // prioritise streaming latency over OTA
+            if (client.connected() && streamFrameCount > 0) {
+              process_stream();
+
+            } else {
+              // loop here for WIFI_WATCHDOG, turning debugData true/false depending on serial input..
+              unsigned long start = millis();
+              
+              while (millis() - start < 2000 ) {
+                  delay(100);
+                  if (otaEnabled) ArduinoOTA.handle();
+                  handleSerial();
+              }
+                
+            }
+            if (millis() - lastHeartBeat > 8000) {
+              lastHeartBeat = millis();
+              pongMQTT();
+            }
+            
         } else {
             // disconnected; attempt to reconnect
             if (!warned) {

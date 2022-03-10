@@ -61,8 +61,6 @@ extern bool haveTime;
 extern int sketchSize;
 extern int sketchSpace;
 extern String sketchMD5;
-extern bool otaEnabled;
-extern char otaPassword[];
 
 typedef struct {
         httpd_req_t *req;
@@ -77,14 +75,6 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 httpd_handle_t stream_httpd = NULL;
 httpd_handle_t camera_httpd = NULL;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-uint8_t temprature_sens_read();
-#ifdef __cplusplus
-}
-#endif
-
 void serialDump() {
     Serial.println();
     // Module
@@ -98,15 +88,6 @@ void serialDump() {
     Serial.printf("Sketch Size: %i (total: %i, %.1f%% used)\r\n", sketchSize, sketchSpace, sketchPct);
     Serial.printf("MD5: %s\r\n", sketchMD5.c_str());
     Serial.printf("ESP sdk: %s\r\n", ESP.getSdkVersion());
-    if (otaEnabled) {
-         if (strlen(otaPassword) != 0) {
-            Serial.printf("OTA: Enabled, Password: %s\n\r", otaPassword);
-         } else {
-            Serial.printf("OTA: Enabled, No Password! (insecure)\n\r");
-         }
-    } else {
-        Serial.printf("OTA: Disabled\n\r");
-    }
     // Network
     if (accesspoint) {
         if (captivePortal) {
@@ -138,25 +119,14 @@ void serialDump() {
     int upHours = int64_t(floor(sec/3600)) % 24;
     int upMin = int64_t(floor(sec/60)) % 60;
     int upSec = sec % 60;
-    int McuTc = (temprature_sens_read() - 32) / 1.8; // celsius
-    int McuTf = temprature_sens_read(); // fahrenheit
     Serial.printf("System up: %" PRId64 ":%02i:%02i:%02i (d:h:m:s)\r\n", upDays, upHours, upMin, upSec);
     Serial.printf("Active streams: %i, Previous streams: %lu, Images captured: %lu\r\n", streamCount, streamsServed, imagesServed);
     Serial.printf("Freq: %i MHz\r\n", ESP.getCpuFreqMHz());
-    Serial.printf("MCU temperature : %i C, %i F  (approximate)\r\n", McuTc, McuTf);
     Serial.printf("Heap: %i, free: %i, min free: %i, max block: %i\r\n", ESP.getHeapSize(), ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
-    if(psramFound()) {
-        Serial.printf("Psram: %i, free: %i, min free: %i, max block: %i\r\n", ESP.getPsramSize(), ESP.getFreePsram(), ESP.getMinFreePsram(), ESP.getMaxAllocPsram());
-    } else {
-        Serial.printf("Psram: Not found; please check your board configuration.\r\n");
-        Serial.printf("- High resolution/quality settings will show incomplete frames to low memory.\r\n");
-    }
+    Serial.printf("Psram: %i, free: %i, min free: %i, max block: %i\r\n", ESP.getPsramSize(), ESP.getFreePsram(), ESP.getMinFreePsram(), ESP.getMaxAllocPsram());
     // Filesystems
-    if (filesystem && (SPIFFS.totalBytes() > 0)) {
+    if (filesystem) {
         Serial.printf("Spiffs: %i, used: %i\r\n", SPIFFS.totalBytes(), SPIFFS.usedBytes());
-    } else {
-        Serial.printf("Spiffs: No filesystem found, please check your board configuration.\r\n");
-        Serial.printf("- Saving and restoring camera settings will not function without this.\r\n");
     }
     Serial.println("Preferences file: ");
     dumpPrefs(SPIFFS);
@@ -165,6 +135,18 @@ void serialDump() {
     }
     Serial.println();
     return;
+}
+
+static size_t jpg_encode_stream(void * arg, size_t index, const void* data, size_t len){
+    jpg_chunking_t *j = (jpg_chunking_t *)arg;
+    if(!index){
+        j->len = 0;
+    }
+    if(httpd_resp_send_chunk(j->req, (const char *)data, len) != ESP_OK){
+        return 0;
+    }
+    j->len += len;
+    return len;
 }
 
 static esp_err_t capture_handler(httpd_req_t *req){
@@ -194,8 +176,10 @@ static esp_err_t capture_handler(httpd_req_t *req){
         fb_len = fb->len;
         res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
     } else {
-        res = ESP_FAIL;
-        Serial.println("Capture Error: Non-JPEG image returned by camera module");
+        jpg_chunking_t jchunk = {req, 0};
+        res = frame2jpg_cb(fb, 80, jpg_encode_stream, &jchunk)?ESP_OK:ESP_FAIL;
+        httpd_resp_send_chunk(req, NULL, 0);
+        fb_len = jchunk.len;
     }
     esp_camera_fb_return(fb);
     int64_t fr_end = esp_timer_get_time();
@@ -243,8 +227,13 @@ static esp_err_t stream_handler(httpd_req_t *req){
             res = ESP_FAIL;
         } else {
             if(fb->format != PIXFORMAT_JPEG){
-                Serial.println("STREAM: Non-JPEG frame returned by camera module");
-                res = ESP_FAIL;
+                bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+                esp_camera_fb_return(fb);
+                fb = NULL;
+                if(!jpeg_converted){
+                    Serial.println("STREAM: JPEG compression failed");
+                    res = ESP_FAIL;
+                }
             } else {
                 _jpg_buf_len = fb->len;
                 _jpg_buf = fb->buf;
@@ -296,7 +285,6 @@ static esp_err_t cmd_handler(httpd_req_t *req){
     size_t buf_len;
     char variable[32] = {0,};
     char value[32] = {0,};
-
     flashLED(75);
 
     buf_len = httpd_req_get_url_query_len(req) + 1;
@@ -501,8 +489,8 @@ static esp_err_t dump_handler(httpd_req_t *req){
     d+= sprintf(d,"<body>\n");
     d+= sprintf(d,"<img src=\"/logo.svg\" style=\"position: relative; float: right;\">\n"); 
     if (critERR.length() > 0) {
-        d+= sprintf(d,"<span style=\"color:red;\">%s<hr></span>\n", critERR.c_str());
-        d+= sprintf(d,"<h2 style=\"color:red;\">(the serial log may give more information)</h2><br>\n");
+        d+= sprintf(d,"Hardware Error Detected!\n(the serial log may give more information)\n");
+        d+= sprintf(d,"%s<hr>\n", critERR.c_str());
     }
     d+= sprintf(d,"<h1>ESP32 Cam Webserver</h1>\n");
     // Module
@@ -555,26 +543,13 @@ static esp_err_t dump_handler(httpd_req_t *req){
     int upHours = int64_t(floor(sec/3600)) % 24;
     int upMin = int64_t(floor(sec/60)) % 60;
     int upSec = sec % 60;
-    int McuTc = (temprature_sens_read() - 32) / 1.8; // celsius
-    int McuTf = temprature_sens_read(); // fahrenheit
-
     d+= sprintf(d,"Up: %" PRId64 ":%02i:%02i:%02i (d:h:m:s)<br>\n", upDays, upHours, upMin, upSec);
     d+= sprintf(d,"Active streams: %i, Previous streams: %lu, Images captured: %lu<br>\n", streamCount, streamsServed, imagesServed);
     d+= sprintf(d,"Freq: %i MHz<br>\n", ESP.getCpuFreqMHz());
-    d+= sprintf(d,"<span title=\"NOTE: Internal temperature sensor readings can be innacurate on the ESP32-c1 chipset, and may vary significantly between devices!\">");
-    d+= sprintf(d,"MCU temperature : %i &deg;C, %i &deg;F</span>\n<br>", McuTc, McuTf);
     d+= sprintf(d,"Heap: %i, free: %i, min free: %i, max block: %i<br>\n", ESP.getHeapSize(), ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
-    if (psramFound()) {
-        d+= sprintf(d,"Psram: %i, free: %i, min free: %i, max block: %i<br>\n", ESP.getPsramSize(), ESP.getFreePsram(), ESP.getMinFreePsram(), ESP.getMaxAllocPsram());
-    } else {
-        d+= sprintf(d,"Psram: <span style=\"color:red;\">Not found</span>, please check your board configuration.<br>\n");
-        d+= sprintf(d,"- High resolution/quality images & streams will show incomplete frames due to low memory.<br>\n");
-    }
-    if (filesystem && (SPIFFS.totalBytes() > 0)) {
+    d+= sprintf(d,"Psram: %i, free: %i, min free: %i, max block: %i<br>\n", ESP.getPsramSize(), ESP.getFreePsram(), ESP.getMinFreePsram(), ESP.getMaxAllocPsram());
+    if (filesystem) {
         d+= sprintf(d,"Spiffs: %i, used: %i<br>\n", SPIFFS.totalBytes(), SPIFFS.usedBytes());
-    } else {
-        d+= sprintf(d,"Spiffs: <span style=\"color:red;\">No filesystem found</span>, please check your board configuration.<br>\n");
-        d+= sprintf(d,"- saving and restoring camera settings will not function without this.<br>\n");
     }
 
     // Footer

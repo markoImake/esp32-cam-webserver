@@ -6,7 +6,7 @@ The WebUI and camera server communicate entirely via HTTP requests and responses
 ## URI's
 ### Http Port
 * `/` - Default index
-* `/?view=full|simple|portal` - Go direct to specific index
+* `/?target=full|simple|portal` - Go direct to specific index
 * `/capture` - Return a Jpeg snapshot image
 * `/status` - Returns a JSON string with all camera status <key>/<value> pairs listed
 * `/control?var=<key>&val=<val>` - Set `<key>` to `<val>`
@@ -96,7 +96,7 @@ reboot          - Reboots the camera
   * `http://<IP-ADDRESS>/control?var=lamp&val=50`
   * `http://<IP-ADDRESS>/control?var=lamp&val=0`
 * Set resolution to VGA
-  * `http://<IP-ADDRESS>/control?var=framesize&val=8`
+  * `http://<IP-ADDRESS>/control?var=framesize&val=6`
 * Show camera details and settings
   * All settings are returned via single `status` call in [JSON](https://www.json.org/) format.
   * `http://<IP-ADDRESS>/status`

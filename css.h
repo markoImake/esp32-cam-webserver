@@ -33,7 +33,6 @@ section.main {
 #menu {
   display: none;
   flex-wrap: nowrap;
-  color: #EFEFEF;
   width: 380px;
   background: #363636;
   padding: 8px;
