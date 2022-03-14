@@ -488,7 +488,8 @@ void setup() {
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = XCLK_FREQ_HZ;
-    config.pixel_format = PIXFORMAT_JPEG;
+    // config.pixel_format = PIXFORMAT_JPEG;
+    config.pixel_format = PIXFORMAT_RGB565;
     // Pre-allocate large buffers
     if(psramFound()){
         Serial.println("psram Found");
@@ -496,7 +497,7 @@ void setup() {
         config.jpeg_quality = 10;
         config.fb_count = 2;  // We can be generous since we are not using facedetect anymore, allows for bigger jpeg frame size (data)
     } else {
-        Serial.println("psram Found");
+        Serial.println("no psram Found");
         config.frame_size = FRAMESIZE_SVGA;
         config.jpeg_quality = 12;
         config.fb_count = 1;
@@ -833,6 +834,86 @@ void process_stream() {
     
     Serial.println("camera busy");
   }
+}
+
+
+void process_stream_square() {
+  
+  Serial.println("process_stream streamFrameCount");
+  Serial.println(streamFrameCount);
+  if (!cameraBusy) {
+    
+    Serial.println("get new stream frame");
+    cameraBusy = true;
+    camera_fb_t * fb = NULL;
+    fb = esp_camera_fb_get(); // used to get a single picture.
+    if (!fb) {
+      cameraBusy = false;
+      delay(500);
+      return;
+    }
+    // for 640x480 frame size, crop 80 from left and right to make square image
+    crop_image(fb, 80, 80, 0, 0);
+    // Create a buffer for the JPG in psram, 100kb max
+    uint8_t * jpg_buf = (uint8_t *) heap_caps_malloc(100000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if(jpg_buf == NULL){
+        Serial.println("Malloc failed to allocate buffer for JPG.\n");
+      esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+    }else{
+        size_t jpg_size = 0;
+
+        // Convert the RAW image into JPG
+        // The parameter "31" is the JPG quality. Higher is better.
+        fmt2jpg(fb->buf, fb->len, fb->width, fb->height, fb->format, 31, &jpg_buf, &jpg_size);
+//        Serial.println("Converted JPG size: %d bytes \n", jpg_size);
+
+      esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+      sendStreamMQTT(jpg_buf, jpg_size);
+    }
+    cameraBusy = false;
+  } else {
+    
+    Serial.println("camera busy");
+  }
+}
+
+void crop_image(camera_fb_t *fb, unsigned short cropLeft, unsigned short cropRight, unsigned short cropTop, unsigned short cropBottom)
+{
+    unsigned int maxTopIndex = cropTop * fb->width * 2;
+    unsigned int minBottomIndex = ((fb->width*fb->height) - (cropBottom * fb->width)) * 2;
+    unsigned short maxX = fb->width - cropRight; // In pixels
+    unsigned short newWidth = fb->width - cropLeft - cropRight;
+    unsigned short newHeight = fb->height - cropTop - cropBottom;
+    size_t newJpgSize = newWidth * newHeight *2;
+
+    unsigned int writeIndex = 0;
+    // Loop over all bytes
+    for(int i = 0; i < fb->len; i+=2){
+        // Calculate current X, Y pixel position
+        int x = (i/2) % fb->width;
+
+        // Crop from the top
+        if(i < maxTopIndex){ continue; }
+
+        // Crop from the bottom
+        if(i > minBottomIndex){ continue; }
+
+        // Crop from the left
+        if(x <= cropLeft){ continue; }
+
+        // Crop from the right
+        if(x > maxX){ continue; }
+
+        // If we get here, keep the pixels
+        fb->buf[writeIndex++] = fb->buf[i];
+        fb->buf[writeIndex++] = fb->buf[i+1];
+    }
+
+    // Set the new dimensions of the framebuffer for further use.
+    fb->width = newWidth;
+    fb->height = newHeight;
+    fb->len = newJpgSize;
 }
 
 
