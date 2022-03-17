@@ -742,7 +742,7 @@ void callback(String topic, byte* message, unsigned int length) {
     messageTemp += (char)message[i];
   }
   if (topic == topic_PHOTO) {
-    take_picture();
+    take_picture_square();
   } else if (topic == topic_STARTSTREAM) {
     streamFrameCount = 30;
 //    take_picture();
@@ -811,6 +811,32 @@ void take_picture() {
   
 }
 
+void take_picture_square() {
+  camera_fb_t * fb = NULL;
+  Serial.println("Taking picture");
+  fb = esp_camera_fb_get(); // used to get a single picture.
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
+  }
+  Serial.println("Picture taken");
+
+
+  // for 640x480 frame size, crop 80 from left and right to make square image
+  crop_image(fb, 80, 80, 0, 0);
+  
+  byte* jpg_buf = NULL;
+  size_t jpg_size = 0;
+  
+  // Convert the RAW image into JPG
+  // The parameter "31" is the JPG quality. Higher is better.
+  fmt2jpg(fb->buf, fb->len, fb->width, fb->height, fb->format, 31, &jpg_buf, &jpg_size);
+  
+  sendPhotoMQTT(jpg_buf, jpg_size);
+  esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+  free(jpg_buf);
+}
+
 void process_stream() {
   
   Serial.println("process_stream streamFrameCount");
@@ -842,7 +868,7 @@ void process_stream_square() {
   Serial.println(streamFrameCount);
   if (!cameraBusy) {
     
-    Serial.println("get new stream frame");
+    Serial.println("get new stream frame from camera");
     cameraBusy = true;
     camera_fb_t * fb = NULL;
     fb = esp_camera_fb_get(); // used to get a single picture.
@@ -854,26 +880,16 @@ void process_stream_square() {
     // for 640x480 frame size, crop 80 from left and right to make square image
     crop_image(fb, 80, 80, 0, 0);
     
-    // Create a buffer for the JPG in psram, 100kb max
-    
-//    uint8_t * jpg_buf = (uint8_t *) heap_caps_malloc(100000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     byte* jpg_buf = NULL;
-//    if(jpg_buf == NULL){
-//        Serial.println("Malloc failed to allocate buffer for JPG.\n");
-//      esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
-//    }else{
-        size_t jpg_size = 0;
-
-        // Convert the RAW image into JPG
-        // The parameter "31" is the JPG quality. Higher is better.
-        fmt2jpg(fb->buf, fb->len, fb->width, fb->height, fb->format, 31, &jpg_buf, &jpg_size);
-//        Serial.println("Converted JPG size: %d bytes \n", jpg_size);
-
-      esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
-      sendStreamMQTT(jpg_buf, jpg_size);
-//      heap_caps_free(jpg_buf);
-      free(jpg_buf);
-//    }
+    size_t jpg_size = 0;
+    
+    // Convert the RAW image into JPG
+    // The parameter "31" is the JPG quality. Higher is better.
+    fmt2jpg(fb->buf, fb->len, fb->width, fb->height, fb->format, 31, &jpg_buf, &jpg_size);
+    
+    esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+    sendStreamMQTT(jpg_buf, jpg_size);
+    free(jpg_buf);
     cameraBusy = false;
   } else {
     
