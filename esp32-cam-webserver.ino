@@ -493,12 +493,12 @@ void setup() {
     // Pre-allocate large buffers
     if(psramFound()){
         Serial.println("psram Found");
-        config.frame_size = FRAMESIZE_UXGA;
+        config.frame_size = FRAMESIZE_VGA;
         config.jpeg_quality = 10;
-        config.fb_count = 2;  // We can be generous since we are not using facedetect anymore, allows for bigger jpeg frame size (data)
+        config.fb_count = 1;  // We can be generous since we are not using facedetect anymore, allows for bigger jpeg frame size (data)
     } else {
         Serial.println("no psram Found");
-        config.frame_size = FRAMESIZE_SVGA;
+        config.frame_size = FRAMESIZE_VGA;
         config.jpeg_quality = 12;
         config.fb_count = 1;
     }
@@ -794,7 +794,6 @@ void sendStreamMQTT(const uint8_t * buf, uint32_t len){
       streamFrameCount = streamFrameCount - 1;
     }
     Serial.println(rc);
-   Serial.println("\n");
   }
 }
 
@@ -854,13 +853,15 @@ void process_stream_square() {
     }
     // for 640x480 frame size, crop 80 from left and right to make square image
     crop_image(fb, 80, 80, 0, 0);
+    
     // Create a buffer for the JPG in psram, 100kb max
-    uint8_t * jpg_buf = (uint8_t *) heap_caps_malloc(100000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-    if(jpg_buf == NULL){
-        Serial.println("Malloc failed to allocate buffer for JPG.\n");
-      esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
-    }else{
+    
+//    uint8_t * jpg_buf = (uint8_t *) heap_caps_malloc(100000, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    byte* jpg_buf = NULL;
+//    if(jpg_buf == NULL){
+//        Serial.println("Malloc failed to allocate buffer for JPG.\n");
+//      esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+//    }else{
         size_t jpg_size = 0;
 
         // Convert the RAW image into JPG
@@ -870,7 +871,9 @@ void process_stream_square() {
 
       esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
       sendStreamMQTT(jpg_buf, jpg_size);
-    }
+//      heap_caps_free(jpg_buf);
+      free(jpg_buf);
+//    }
     cameraBusy = false;
   } else {
     
@@ -949,14 +952,19 @@ void reconnect() {
   }
 }
 
+String getAllHeap(){
+  char temp[300];
+  sprintf(temp, "Loop... Heap: Free:%i, Min:%i, Size:%i, Alloc:%i, psram:%i, ps_free:%i\n", ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getHeapSize(), ESP.getMaxAllocHeap(), ESP.getPsramSize(), ESP.getFreePsram());
+  return temp;
+}
+
 void loop() {
     /* 
      *  Just loop forever, reconnecting Wifi As necesscary in client mode
      * The stream and URI handler processes initiated by the startCameraServer() call at the
      * end of setup() will handle the camera and UI processing from now on.
     */
-    
-    Serial.print("loop");
+    Serial.print(getAllHeap());
     if (accesspoint) {
         // Accespoint is permanently up, so just loop, servicing the captive portal as needed
         // Rather than loop forever, follow the watchdog, in case we later add auto re-scan.
@@ -984,8 +992,8 @@ void loop() {
             client.loop();
             // prioritise streaming latency over OTA
             if (client.connected() && streamFrameCount > 0) {
-              process_stream();
-
+//              process_stream();
+              process_stream_square();
             } else {
               // loop here for WIFI_WATCHDOG, turning debugData true/false depending on serial input..
               unsigned long start = millis();
